@@ -25,8 +25,9 @@ go install github.com/gengwg/whocan@latest
 whocan [group/project] [branch] [merge|push]
 ```
 
-With no arguments it checks the repo in the current directory. The branch defaults to `develop` if the project has one (git-flow), else the
-project's default branch. The action defaults to `merge`.
+With no arguments it checks the repo in the current directory. The branch
+defaults to `develop` if the project has one (git-flow), else the project's
+default branch. The action defaults to `merge`.
 Exit status is 0 if you can, 1 if you cannot, 2 on error, so scripts can check
 before planning a merge.
 
