@@ -12,7 +12,7 @@ can: bob (Maintainer), carol (Owner)
 
 ## Install
 
-Requires Go and an authenticated [glab](https://gitlab.com/gitlab-org/cli)
+Requires Go 1.22+ and an authenticated [glab](https://gitlab.com/gitlab-org/cli)
 (self-hosted GitLab works via `GITLAB_HOST`).
 
 ```
