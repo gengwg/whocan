@@ -25,7 +25,8 @@ go install github.com/gengwg/whocan@latest
 whocan <group/project> [branch] [merge|push]
 ```
 
-The branch defaults to the project's default branch, the action to `merge`.
+The branch defaults to `develop` if the project has one (git-flow), else the
+project's default branch. The action defaults to `merge`.
 Exit status is 0 if you can, 1 if you cannot, 2 on error, so scripts can check
 before planning a merge.
 
