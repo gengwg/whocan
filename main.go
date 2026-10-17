@@ -3,7 +3,8 @@
 //
 //	whocan <group/project> [branch] [merge|push]
 //
-// The branch defaults to the project's default branch, the action to merge.
+// The branch defaults to develop if the project has one, else the project's
+// default branch; the action defaults to merge.
 // Exit 0 when you can, 1 when you cannot, 2 on error. Needs an authenticated
 // glab.
 package main
@@ -229,12 +230,25 @@ func run(args []string) (bool, error) {
 	if err := glabGet("projects/"+url.PathEscape(args[0]), &proj); err != nil {
 		return false, err
 	}
+	base := fmt.Sprintf("projects/%d/", proj.ID)
 	branch := proj.DefaultBranch
 	if len(args) >= 2 {
 		branch = args[1]
+	} else {
+		// In develop/main (git-flow) projects, day-to-day merges target develop.
+		var found []struct {
+			Name string `json:"name"`
+		}
+		if err := glabGet(base+"repository/branches?search="+url.QueryEscape("^develop$"), &found); err != nil {
+			return false, err
+		}
+		for _, b := range found {
+			if b.Name == "develop" {
+				branch = "develop"
+			}
+		}
 	}
 
-	base := fmt.Sprintf("projects/%d/", proj.ID)
 	rules, err := glabList[protectedBranch](base + "protected_branches")
 	if err != nil {
 		return false, err
