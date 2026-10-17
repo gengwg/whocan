@@ -1,10 +1,11 @@
 // whocan reports who may merge into (or push to) a GitLab branch, from live
 // API data, so a plan learns about a permission wall before it reaches it.
 //
-//	whocan <group/project> [branch] [merge|push]
+//	whocan [group/project] [branch] [merge|push]
 //
-// The branch defaults to develop if the project has one, else the project's
-// default branch; the action defaults to merge.
+// The project defaults to the current directory's repo. The branch defaults to
+// develop if the project has one, else the project's default branch; the action
+// defaults to merge.
 // Exit 0 when you can, 1 when you cannot, 2 on error. Needs an authenticated
 // glab.
 package main
@@ -211,8 +212,13 @@ func glabGet(endpoint string, v any) error {
 }
 
 func run(args []string) (bool, error) {
-	if len(args) < 1 || len(args) > 3 {
-		return false, errors.New("usage: whocan <group/project> [branch] [merge|push]")
+	if len(args) > 3 {
+		return false, errors.New("usage: whocan [group/project] [branch] [merge|push]")
+	}
+	// glab resolves :fullpath from the current directory's git remote.
+	project := ":fullpath"
+	if len(args) > 0 {
+		project = url.PathEscape(args[0])
 	}
 	action := "merge"
 	if len(args) == 3 {
@@ -227,7 +233,7 @@ func run(args []string) (bool, error) {
 		Path          string `json:"path_with_namespace"`
 		DefaultBranch string `json:"default_branch"`
 	}
-	if err := glabGet("projects/"+url.PathEscape(args[0]), &proj); err != nil {
+	if err := glabGet("projects/"+project, &proj); err != nil {
 		return false, err
 	}
 	base := fmt.Sprintf("projects/%d/", proj.ID)
