@@ -234,6 +234,9 @@ func run(args []string) (bool, error) {
 		DefaultBranch string `json:"default_branch"`
 	}
 	if err := glabGet("projects/"+project, &proj); err != nil {
+		if len(args) == 0 && strings.Contains(err.Error(), "Unable to expand placeholder") {
+			return false, errors.New("not in a GitLab repo; pass <group/project>")
+		}
 		return false, err
 	}
 	base := fmt.Sprintf("projects/%d/", proj.ID)
