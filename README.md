@@ -38,7 +38,9 @@ roles. Access-token bot users are hidden.
 ## Limits
 
 - GitLab only.
-- CODEOWNERS is not evaluated. When a branch requires code-owner approval,
-  whocan prints a note; the approval may still be needed.
+- It checks who may merge into the branch, not whether a given MR can merge.
+  Required approvals (a minimum count, or code owners of the files the MR
+  touches) and pipelines that must pass can still block the merge. When a
+  branch requires code-owner approval, whocan prints a note.
 - Rules that grant access to a group are reported as an error rather than
   resolved.
