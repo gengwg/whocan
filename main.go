@@ -73,6 +73,31 @@ func permits(e accessLevel, m member) bool {
 	return m.AccessLevel >= e.AccessLevel
 }
 
+// describe names what actually grants access: the most permissive role level
+// plus any individually named users. Deploy keys grant no person.
+func describe(entries []accessLevel) string {
+	var role *accessLevel
+	var users []string
+	for _, e := range entries {
+		switch {
+		case e.DeployKeyID != nil:
+		case e.UserID != nil:
+			if !slices.Contains(users, e.Description) {
+				users = append(users, e.Description)
+			}
+		case role == nil || (e.AccessLevel != 0 && (role.AccessLevel == 0 || e.AccessLevel < role.AccessLevel)):
+			role = &e
+		}
+	}
+	if role == nil || (role.AccessLevel == 0 && len(users) > 0) {
+		if len(users) == 0 {
+			return "No one"
+		}
+		return strings.Join(users, ", ")
+	}
+	return strings.Join(append([]string{role.Description}, users...), ", ")
+}
+
 // decide applies GitLab's rule: when several protected-branch rules match,
 // the most permissive one controls the branch, so the allowed set is the union.
 func decide(rules []protectedBranch, members []member, branch, action string) (verdict, error) {
@@ -85,7 +110,6 @@ func decide(rules []protectedBranch, members []member, branch, action string) (v
 
 	var v verdict
 	var entries []accessLevel
-	var descs []string
 	if len(matched) == 0 {
 		entries = []accessLevel{{AccessLevel: developer}}
 	} else {
@@ -102,12 +126,9 @@ func decide(rules []protectedBranch, members []member, branch, action string) (v
 					return v, fmt.Errorf("rule %q grants %s to a group, which whocan does not resolve", r.Name, action)
 				}
 				entries = append(entries, e)
-				if !slices.Contains(descs, e.Description) {
-					descs = append(descs, e.Description)
-				}
 			}
 		}
-		v.Rule = strings.Join(descs, ", ")
+		v.Rule = describe(entries)
 	}
 
 	for _, m := range members {

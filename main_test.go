@@ -76,6 +76,28 @@ func TestDecide(t *testing.T) {
 	}
 }
 
+func TestDescribeNamesMostPermissive(t *testing.T) {
+	bob := accessLevel{AccessLevel: 40, UserID: ptr(3), Description: "Bob"}
+	key := accessLevel{AccessLevel: 40, DeployKeyID: ptr(9), Description: "ci key"}
+	tests := []struct {
+		entries []accessLevel
+		want    string
+	}{
+		{[]accessLevel{maintainers, developers}, "Developers + Maintainers"},
+		{[]accessLevel{developers, maintainers}, "Developers + Maintainers"},
+		{[]accessLevel{noOne, maintainers}, "Maintainers"},
+		{[]accessLevel{noOne}, "No one"},
+		{[]accessLevel{noOne, bob}, "Bob"},
+		{[]accessLevel{maintainers, bob, bob}, "Maintainers, Bob"},
+		{[]accessLevel{key}, "No one"},
+	}
+	for _, tt := range tests {
+		if got := describe(tt.entries); got != tt.want {
+			t.Errorf("describe(%v) = %q, want %q", tt.entries, got, tt.want)
+		}
+	}
+}
+
 func TestDecideRefusesGroupEntries(t *testing.T) {
 	rules := []protectedBranch{rule("main", accessLevel{AccessLevel: 30, GroupID: ptr(7)})}
 	if _, err := decide(rules, team, "main", "merge"); err == nil {
