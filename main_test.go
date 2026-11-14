@@ -336,3 +336,213 @@ func TestRunRefusesCustomRole(t *testing.T) {
 		t.Errorf("output = %q, want none", out.String())
 	}
 }
+
+func TestDeveloperInitialPush(t *testing.T) {
+	tests := []struct {
+		name     string
+		legacy   *int
+		defaults *defaultBranchProtection
+		want     bool
+		wantErr  bool
+	}{
+		{"defaults allow initial push", ptr(2), &defaultBranchProtection{DeveloperCanInitialPush: true}, true, false},
+		{"defaults allow developer push", nil, &defaultBranchProtection{AllowedToPush: []accessLevel{{AccessLevel: 30}}}, true, false},
+		{"defaults are maintainer only", nil, &defaultBranchProtection{AllowedToPush: []accessLevel{{AccessLevel: 40}}}, false, false},
+		{"legacy not protected", ptr(0), nil, true, false},
+		{"legacy partially protected", ptr(1), nil, true, false},
+		{"legacy fully protected", ptr(2), nil, false, false},
+		{"legacy protected against pushes", ptr(3), nil, false, false},
+		{"legacy protected after initial push", ptr(4), nil, true, false},
+		{"settings unavailable", nil, nil, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := developerInitialPush(tt.legacy, tt.defaults)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("developerInitialPush = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecideAdministratorEntry(t *testing.T) {
+	rules := []protectedBranch{{
+		Name:  "main",
+		Merge: []accessLevel{{AccessLevel: 60, Description: "Administrators"}},
+		Push:  []accessLevel{noOne},
+	}}
+	tests := []struct {
+		name   string
+		member member
+		want   []string
+	}{
+		{"admin owner", member{ID: 1, Username: "root", AccessLevel: 50, State: "active", IsAdmin: true}, []string{"root"}},
+		{"non-admin owner", member{ID: 1, Username: "owner", AccessLevel: 50, State: "active"}, nil},
+		{"admin without membership", member{ID: 1, Username: "root", State: "active", IsAdmin: true}, []string{"root"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v, err := decide(rules, []member{tt.member}, "main", "merge", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := usernames(v.Allowed); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("allowed = %v, want %v", got, tt.want)
+			}
+			if !v.Administrators {
+				t.Error("Administrators = false, want true")
+			}
+		})
+	}
+}
+
+func blankProjectResponse(kind string) string {
+	return fmt.Sprintf(`{"id":42,"path_with_namespace":"acme/demo","default_branch":"main","empty_repo":true,"namespace":{"id":7,"kind":%q}}`, kind)
+}
+
+func TestRunBlankRepositoryNotActionable(t *testing.T) {
+	tests := []struct {
+		name    string
+		kind    string
+		branch  string
+		action  string
+		wantErr string
+	}{
+		{"merge has no target", "group", "main", "merge", "blank repository has no target branch"},
+		{"personal namespace settings are unknown on any ref", "user", "topic", "push", "personal namespace"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeGlab(t, map[string]string{"projects/acme%2Fdemo": blankProjectResponse(tt.kind)})
+			var out bytes.Buffer
+			can, err := run([]string{"acme/demo", tt.branch, tt.action}, &out)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+			if can {
+				t.Error("can = true, want false")
+			}
+			if out.Len() != 0 {
+				t.Errorf("output = %q, want none", out.String())
+			}
+		})
+	}
+}
+
+func TestRunBlankRepositoryInitialPush(t *testing.T) {
+	tests := []struct {
+		name     string
+		branch   string
+		settings string
+		wantCan  bool
+	}{
+		{
+			name:     "fully protected",
+			branch:   "main",
+			settings: `{"default_branch_protection_defaults":{"allowed_to_push":[{"access_level":40}]}}`,
+			wantCan:  false,
+		},
+		{
+			name:     "fully protected after initial push",
+			branch:   "main",
+			settings: `{"default_branch_protection_defaults":{"allowed_to_push":[{"access_level":40}],"developer_can_initial_push":true}}`,
+			wantCan:  true,
+		},
+		{
+			name:     "partially protected",
+			branch:   "main",
+			settings: `{"default_branch_protection_defaults":{"allowed_to_push":[{"access_level":30}]}}`,
+			wantCan:  true,
+		},
+		{
+			name:     "fully protected on non-default ref",
+			branch:   "topic",
+			settings: `{"default_branch_protection_defaults":{"allowed_to_push":[{"access_level":40}]}}`,
+			wantCan:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			responses := runResponses(`{}`, `{"id":3,"username":"dev"}`)
+			responses["projects/acme%2Fdemo"] = blankProjectResponse("group")
+			delete(responses, "--paginate projects/42/protected_branches?per_page=100")
+			responses["groups/7?with_projects=false"] = tt.settings
+			fakeGlab(t, responses)
+
+			var out bytes.Buffer
+			can, err := run([]string{"acme/demo", tt.branch, "push"}, &out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if can != tt.wantCan {
+				t.Errorf("can = %v, want %v", can, tt.wantCan)
+			}
+			var want string
+			if tt.wantCan {
+				want = fmt.Sprintf("acme/demo %s push: protected (Developers + Maintainers)\n", tt.branch) +
+					"you: dev (Developer), can\n" +
+					"can: dev (Developer), grouped (Developer), inherited (Maintainer)\n"
+			} else {
+				want = fmt.Sprintf("acme/demo %s push: protected (Maintainers)\n", tt.branch) +
+					"you: dev (Developer), cannot\n" +
+					"can: inherited (Maintainer)\n"
+			}
+			if out.String() != want {
+				t.Errorf("output:\n%s\nwant:\n%s", out.String(), want)
+			}
+		})
+	}
+}
+
+func TestRunAdministratorWithoutProjectMembership(t *testing.T) {
+	rules := `{
+		"name":"main",
+		"merge_access_levels":[{"access_level":60,"access_level_description":"Administrators"}],
+		"push_access_levels":[{"access_level":0,"access_level_description":"No one"}]
+	}`
+	me := `{"id":9,"username":"root","state":"active","is_admin":true}`
+	fakeGlab(t, runResponses(rules, me))
+
+	var out bytes.Buffer
+	can, err := run([]string{"acme/demo", "main", "merge"}, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !can {
+		t.Error("can = false, want true")
+	}
+	want := "acme/demo main merge: protected (Administrators)\n" +
+		"you: root (not a member), can\n" +
+		"can: instance administrators\n"
+	if out.String() != want {
+		t.Errorf("output:\n%s\nwant:\n%s", out.String(), want)
+	}
+}
+
+func TestRunNonmemberAdminDoesNotBypassMembershipGrants(t *testing.T) {
+	rules := `{
+		"name":"main",
+		"merge_access_levels":[{"access_level":null,"user_id":9,"access_level_description":"Root"}],
+		"push_access_levels":[{"access_level":0,"access_level_description":"No one"}]
+	}`
+	me := `{"id":9,"username":"root","state":"active","is_admin":true}`
+	fakeGlab(t, runResponses(rules, me))
+
+	var out bytes.Buffer
+	can, err := run([]string{"acme/demo", "main", "merge"}, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if can {
+		t.Error("can = true, want false")
+	}
+	want := "acme/demo main merge: protected (Root)\n" +
+		"you: root (not a member), cannot\n" +
+		"can: no one\n"
+	if out.String() != want {
+		t.Errorf("output:\n%s\nwant:\n%s", out.String(), want)
+	}
+}
