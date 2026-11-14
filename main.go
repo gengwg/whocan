@@ -26,11 +26,12 @@ import (
 )
 
 type accessLevel struct {
-	AccessLevel int    `json:"access_level"`
-	Description string `json:"access_level_description"`
-	UserID      *int   `json:"user_id"`
-	GroupID     *int   `json:"group_id"`
-	DeployKeyID *int   `json:"deploy_key_id"`
+	AccessLevel  int    `json:"access_level"`
+	Description  string `json:"access_level_description"`
+	UserID       *int   `json:"user_id"`
+	GroupID      *int   `json:"group_id"`
+	MemberRoleID *int   `json:"member_role_id"`
+	DeployKeyID  *int   `json:"deploy_key_id"`
 }
 
 type protectedBranch struct {
@@ -63,12 +64,16 @@ func matches(pattern, branch string) bool {
 	return regexp.MustCompile(re).MatchString(branch)
 }
 
-func permits(e accessLevel, m member) bool {
+func permits(e accessLevel, m member, groups map[int][]member) bool {
 	switch {
-	case e.DeployKeyID != nil:
+	case e.DeployKeyID != nil, e.MemberRoleID != nil:
 		return false
 	case e.UserID != nil:
 		return *e.UserID == m.ID
+	case e.GroupID != nil:
+		return slices.ContainsFunc(groups[*e.GroupID], func(g member) bool {
+			return g.ID == m.ID && g.State == "active" && g.AccessLevel >= developer
+		})
 	case e.AccessLevel == 0: // "No one"
 		return false
 	}
@@ -76,33 +81,41 @@ func permits(e accessLevel, m member) bool {
 }
 
 // describe names what actually grants access: the most permissive role level
-// plus any individually named users. Deploy keys grant no person.
+// plus any named users or groups. Deploy keys grant no person.
 func describe(entries []accessLevel) string {
 	var role *accessLevel
-	var users []string
+	var named []string
 	for _, e := range entries {
 		switch {
 		case e.DeployKeyID != nil:
-		case e.UserID != nil:
-			if !slices.Contains(users, e.Description) {
-				users = append(users, e.Description)
+		case e.UserID != nil, e.GroupID != nil:
+			if !slices.Contains(named, e.Description) {
+				named = append(named, e.Description)
 			}
 		case role == nil || (e.AccessLevel != 0 && (role.AccessLevel == 0 || e.AccessLevel < role.AccessLevel)):
 			role = &e
 		}
 	}
-	if role == nil || (role.AccessLevel == 0 && len(users) > 0) {
-		if len(users) == 0 {
+	if role == nil || (role.AccessLevel == 0 && len(named) > 0) {
+		if len(named) == 0 {
 			return "No one"
 		}
-		return strings.Join(users, ", ")
+		return strings.Join(named, ", ")
 	}
-	return strings.Join(append([]string{role.Description}, users...), ", ")
+	return strings.Join(append([]string{role.Description}, named...), ", ")
+}
+
+func accessEntries(r protectedBranch, action string) []accessLevel {
+	if action == "merge" {
+		// GitLab's "Allowed to push and merge" grants both capabilities.
+		return slices.Concat(r.Merge, r.Push)
+	}
+	return r.Push
 }
 
 // decide applies GitLab's rule: when several protected-branch rules match,
 // the most permissive one controls the branch, so the allowed set is the union.
-func decide(rules []protectedBranch, members []member, branch, action string) (verdict, error) {
+func decide(rules []protectedBranch, members []member, branch, action string, groups map[int][]member) (verdict, error) {
 	var matched []protectedBranch
 	for _, r := range rules {
 		if matches(r.Name, branch) {
@@ -115,17 +128,12 @@ func decide(rules []protectedBranch, members []member, branch, action string) (v
 	if len(matched) == 0 {
 		entries = []accessLevel{{AccessLevel: developer}}
 	} else {
-		v.CodeOwners = true
 		for _, r := range matched {
-			v.CodeOwners = v.CodeOwners && r.CodeOwnersRequired
-			es := r.Merge
-			if action == "push" {
-				es = r.Push
-			}
-			for _, e := range es {
-				if e.GroupID != nil {
-					// Resolving group membership is not implemented; refuse rather than under-report.
-					return v, fmt.Errorf("rule %q grants %s to a group, which whocan does not resolve", r.Name, action)
+			// Unlike access rules, Code Owner approval uses the most restrictive match.
+			v.CodeOwners = v.CodeOwners || r.CodeOwnersRequired
+			for _, e := range accessEntries(r, action) {
+				if e.MemberRoleID != nil {
+					return v, fmt.Errorf("rule %q grants %s to a custom role, which whocan does not resolve", r.Name, action)
 				}
 				entries = append(entries, e)
 			}
@@ -135,7 +143,7 @@ func decide(rules []protectedBranch, members []member, branch, action string) (v
 
 	for _, m := range members {
 		for _, e := range entries {
-			if permits(e, m) {
+			if permits(e, m, groups) {
 				v.Allowed = append(v.Allowed, m)
 				break
 			}
@@ -203,6 +211,31 @@ func glabList[T any](endpoint string) ([]T, error) {
 	return decodeAll[T](bytes.NewReader(out))
 }
 
+func glabGroupMembers(rules []protectedBranch, branch, action string) (map[int][]member, error) {
+	groups := map[int][]member{}
+	for _, r := range rules {
+		if !matches(r.Name, branch) {
+			continue
+		}
+		for _, e := range accessEntries(r, action) {
+			if e.GroupID == nil {
+				continue
+			}
+			id := *e.GroupID
+			if _, loaded := groups[id]; loaded {
+				continue
+			}
+			// Protected-branch group grants include direct group members only.
+			members, err := glabList[member](fmt.Sprintf("groups/%d/members", id))
+			if err != nil {
+				return nil, err
+			}
+			groups[id] = members
+		}
+	}
+	return groups, nil
+}
+
 func glabGet(endpoint string, v any) error {
 	out, err := glab(endpoint)
 	if err != nil {
@@ -211,7 +244,7 @@ func glabGet(endpoint string, v any) error {
 	return json.Unmarshal(out, v)
 }
 
-func run(args []string) (bool, error) {
+func run(args []string, out io.Writer) (bool, error) {
 	if len(args) > 3 {
 		return false, errors.New("usage: whocan [group/project] [branch] [merge|push]")
 	}
@@ -272,7 +305,11 @@ func run(args []string) (bool, error) {
 	}
 
 	members := effective(all)
-	v, err := decide(rules, members, branch, action)
+	groups, err := glabGroupMembers(rules, branch, action)
+	if err != nil {
+		return false, err
+	}
+	v, err := decide(rules, members, branch, action, groups)
 	if err != nil {
 		return false, err
 	}
@@ -281,7 +318,7 @@ func run(args []string) (bool, error) {
 	if v.Rule != "" {
 		rule = "protected (" + v.Rule + ")"
 	}
-	fmt.Printf("%s %s %s: %s\n", proj.Path, branch, action, rule)
+	fmt.Fprintf(out, "%s %s %s: %s\n", proj.Path, branch, action, rule)
 
 	myRole := "not a member"
 	for _, m := range members {
@@ -299,19 +336,19 @@ func run(args []string) (bool, error) {
 	if can {
 		verdict = "can"
 	}
-	fmt.Printf("you: %s (%s), %s\n", me.Username, myRole, verdict)
+	fmt.Fprintf(out, "you: %s (%s), %s\n", me.Username, myRole, verdict)
 	if len(names) == 0 {
 		names = []string{"no one"}
 	}
-	fmt.Printf("can: %s\n", strings.Join(names, ", "))
+	fmt.Fprintf(out, "can: %s\n", strings.Join(names, ", "))
 	if v.CodeOwners && action == "merge" {
-		fmt.Println("note: code-owner approval is also required for owned paths; see CODEOWNERS")
+		fmt.Fprintln(out, "note: code-owner approval is also required for owned paths; see CODEOWNERS")
 	}
 	return can, nil
 }
 
 func main() {
-	can, err := run(os.Args[1:])
+	can, err := run(os.Args[1:], os.Stdout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "whocan:", err)
 		os.Exit(2)

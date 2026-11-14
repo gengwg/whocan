@@ -32,15 +32,20 @@ Exit status is 0 if you can, 1 if you cannot, 2 on error, so scripts can check
 before planning a merge.
 
 It applies GitLab's rules: wildcard protected branches, the most permissive
-matching rule winning, user-specific grants, and effective (inherited) member
-roles. Access-token bot users are hidden.
+matching access rule winning, push access also granting merge access, the most
+restrictive matching Code Owner rule winning, user-specific and direct-group
+grants, and effective (inherited) member roles. Group grants require active
+Developer-or-higher membership in the granted group itself. Access-token bot
+users are hidden.
 
 ## Limits
 
 - GitLab only.
 - It checks who may merge into the branch, not whether a given MR can merge.
-  Required approvals (a minimum count, or code owners of the files the MR
-  touches) and pipelines that must pass can still block the merge. When a
-  branch requires code-owner approval, whocan prints a note.
-- Rules that grant access to a group are reported as an error rather than
+  Required approvals (including Code Owners) and pipelines that must pass can
+  still block the merge. When Code Owner approval is required, whocan prints a
+  note.
+- For pushes, it checks the branch grant only; push rules and other repository
+  policies can still reject a push.
+- Rules that grant access to a custom role are reported as an error rather than
   resolved.
