@@ -47,5 +47,10 @@ users are hidden.
   note.
 - For pushes, it checks the branch grant only; push rules and other repository
   policies can still reject a push.
+- Blank repositories have no merge target. Initial pushes use the direct group's
+  effective default-branch protection. For personal namespaces, whocan reports
+  an error because ordinary members cannot reliably read the instance setting.
+- Administrator grants are reported as `instance administrators` rather than
+  enumerating individual administrator accounts.
 - Rules that grant access to a custom role are reported as an error rather than
   resolved.

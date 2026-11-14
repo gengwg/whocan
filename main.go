@@ -41,20 +41,43 @@ type protectedBranch struct {
 	CodeOwnersRequired bool          `json:"code_owner_approval_required"`
 }
 
+type namespace struct {
+	ID   int    `json:"id"`
+	Kind string `json:"kind"`
+}
+
+type projectInfo struct {
+	ID            int       `json:"id"`
+	Path          string    `json:"path_with_namespace"`
+	DefaultBranch string    `json:"default_branch"`
+	EmptyRepo     bool      `json:"empty_repo"`
+	Namespace     namespace `json:"namespace"`
+}
+
+type defaultBranchProtection struct {
+	AllowedToPush           []accessLevel `json:"allowed_to_push"`
+	DeveloperCanInitialPush bool          `json:"developer_can_initial_push"`
+}
+
 type member struct {
 	ID          int    `json:"id"`
 	Username    string `json:"username"`
 	AccessLevel int    `json:"access_level"`
 	State       string `json:"state"`
+	IsAdmin     bool   `json:"is_admin"`
 }
 
 type verdict struct {
-	Rule       string // "" when the branch is unprotected
-	Allowed    []member
-	CodeOwners bool
+	Rule           string // "" when the branch is unprotected
+	Allowed        []member
+	CodeOwners     bool
+	Administrators bool
 }
 
-const developer = 30
+const (
+	developer     = 30
+	administrator = 60
+)
 
 var roles = map[int]string{10: "Guest", 15: "Planner", 20: "Reporter", 30: "Developer", 40: "Maintainer", 50: "Owner"}
 
@@ -74,6 +97,8 @@ func permits(e accessLevel, m member, groups map[int][]member) bool {
 		return slices.ContainsFunc(groups[*e.GroupID], func(g member) bool {
 			return g.ID == m.ID && g.State == "active" && g.AccessLevel >= developer
 		})
+	case e.AccessLevel == administrator:
+		return m.IsAdmin
 	case e.AccessLevel == 0: // "No one"
 		return false
 	}
@@ -135,6 +160,7 @@ func decide(rules []protectedBranch, members []member, branch, action string, gr
 				if e.MemberRoleID != nil {
 					return v, fmt.Errorf("rule %q grants %s to a custom role, which whocan does not resolve", r.Name, action)
 				}
+				v.Administrators = v.Administrators || e.AccessLevel == administrator
 				entries = append(entries, e)
 			}
 		}
@@ -174,6 +200,18 @@ func effective(all []member) []member {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
 	return out
+}
+
+// candidates marks the current administrator only on real project memberships.
+// A nonmember admin's level-60 verdict is handled separately in run.
+func candidates(members []member, me member) []member {
+	activeAdmin := me.IsAdmin && me.State == "active"
+	for i := range members {
+		if members[i].ID == me.ID {
+			members[i].IsAdmin = activeAdmin
+		}
+	}
+	return members
 }
 
 // decodeAll reads one or more concatenated JSON arrays, which is what
@@ -244,6 +282,51 @@ func glabGet(endpoint string, v any) error {
 	return json.Unmarshal(out, v)
 }
 
+func developerInitialPush(legacy *int, defaults *defaultBranchProtection) (bool, error) {
+	if defaults != nil {
+		if defaults.DeveloperCanInitialPush {
+			return true, nil
+		}
+		return slices.ContainsFunc(defaults.AllowedToPush, func(e accessLevel) bool {
+			return e.AccessLevel == developer
+		}), nil
+	}
+	if legacy != nil {
+		switch *legacy {
+		case 0, 1, 4:
+			return true, nil
+		case 2, 3:
+			return false, nil
+		}
+	}
+	return false, errors.New("initial default-branch protection is unavailable")
+}
+
+func glabInitialPushAccess(ns namespace) ([]accessLevel, error) {
+	if ns.Kind == "user" {
+		return nil, errors.New("cannot determine initial branch protection for a personal namespace")
+	}
+	if ns.Kind != "group" {
+		return nil, fmt.Errorf("cannot determine initial branch protection for namespace kind %q", ns.Kind)
+	}
+	var group struct {
+		Legacy   *int                     `json:"default_branch_protection"`
+		Defaults *defaultBranchProtection `json:"default_branch_protection_defaults"`
+	}
+	if err := glabGet(fmt.Sprintf("groups/%d?with_projects=false", ns.ID), &group); err != nil {
+		return nil, err
+	}
+	developerCan, err := developerInitialPush(group.Legacy, group.Defaults)
+	if err != nil {
+		return nil, err
+	}
+	entry := accessLevel{AccessLevel: 40, Description: "Maintainers"}
+	if developerCan {
+		entry = accessLevel{AccessLevel: developer, Description: "Developers + Maintainers"}
+	}
+	return []accessLevel{entry}, nil
+}
+
 func run(args []string, out io.Writer) (bool, error) {
 	if len(args) > 3 {
 		return false, errors.New("usage: whocan [group/project] [branch] [merge|push]")
@@ -261,11 +344,7 @@ func run(args []string, out io.Writer) (bool, error) {
 		return false, fmt.Errorf("action must be merge or push, got %q", action)
 	}
 
-	var proj struct {
-		ID            int    `json:"id"`
-		Path          string `json:"path_with_namespace"`
-		DefaultBranch string `json:"default_branch"`
-	}
+	var proj projectInfo
 	if err := glabGet("projects/"+project, &proj); err != nil {
 		if len(args) == 0 && strings.Contains(err.Error(), "Unable to expand placeholder") {
 			return false, errors.New("not in a GitLab repo; pass <group/project>")
@@ -291,9 +370,22 @@ func run(args []string, out io.Writer) (bool, error) {
 		}
 	}
 
-	rules, err := glabList[protectedBranch](base + "protected_branches")
-	if err != nil {
-		return false, err
+	var rules []protectedBranch
+	switch {
+	case proj.EmptyRepo && action == "merge":
+		return false, errors.New("blank repository has no target branch; check push instead")
+	case proj.EmptyRepo:
+		entries, err := glabInitialPushAccess(proj.Namespace)
+		if err != nil {
+			return false, err
+		}
+		rules = []protectedBranch{{Name: branch, Push: entries}}
+	default:
+		var err error
+		rules, err = glabList[protectedBranch](base + "protected_branches")
+		if err != nil {
+			return false, err
+		}
 	}
 	all, err := glabList[member](base + "members/all")
 	if err != nil {
@@ -304,7 +396,8 @@ func run(args []string, out io.Writer) (bool, error) {
 		return false, err
 	}
 
-	members := effective(all)
+	projectMembers := effective(all)
+	members := candidates(projectMembers, me)
 	groups, err := glabGroupMembers(rules, branch, action)
 	if err != nil {
 		return false, err
@@ -321,16 +414,22 @@ func run(args []string, out io.Writer) (bool, error) {
 	fmt.Fprintf(out, "%s %s %s: %s\n", proj.Path, branch, action, rule)
 
 	myRole := "not a member"
-	for _, m := range members {
+	for _, m := range projectMembers {
 		if m.ID == me.ID {
 			myRole = roles[m.AccessLevel]
 		}
 	}
-	can := false
+	can := v.Administrators && me.IsAdmin && me.State == "active"
 	var names []string
 	for _, m := range v.Allowed {
-		names = append(names, fmt.Sprintf("%s (%s)", m.Username, roles[m.AccessLevel]))
 		can = can || m.ID == me.ID
+		if v.Administrators && m.IsAdmin {
+			continue
+		}
+		names = append(names, fmt.Sprintf("%s (%s)", m.Username, roles[m.AccessLevel]))
+	}
+	if v.Administrators {
+		names = append(names, "instance administrators")
 	}
 	verdict := "cannot"
 	if can {
